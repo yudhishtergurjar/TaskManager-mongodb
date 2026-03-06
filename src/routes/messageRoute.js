@@ -9,7 +9,7 @@ const router = express.Router();
 router.use(authMiddleware);
 
 router.get("/:id",isMember, getMessages);
-router.patch("/messages/:id", editMessage);
-router.delete("/messages/:id", deleteMessage);
+router.patch("/edit/:id", editMessage);
+router.delete("/delete/:id", deleteMessage);
 
 export default router;

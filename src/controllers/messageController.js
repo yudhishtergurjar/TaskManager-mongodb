@@ -114,7 +114,7 @@ export const deleteMessage = async(req,res)=>{
         io.to(`project:${message.projectId}`).emit("message:deleted",{
             messageId:message._id
         });
-55
+
         res.json({
             message:"Message deleted"
         });
