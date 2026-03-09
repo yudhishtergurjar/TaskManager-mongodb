@@ -25,6 +25,9 @@ Built with Node.js · Express · MongoDB · Redis · Socket.io
 - [Tech Stack](#-tech-stack)
 - [Data Models](#-data-models)
 - [API Reference](#-api-reference)
+- [Session Management](#-session-management)
+- [Real-Time Events (Socket.io)](#-real-time-events-socketio)
+- [Multi-Server Scalability (IORedis Pub/Sub)](#-multi-server-scalability-ioredis-pubsub)
 - [Getting Started](#-getting-started)
 - [Environment Variables](#-environment-variables)
 - [Usage](#-usage)
@@ -46,11 +49,13 @@ TaskManager API is a backend service designed for teams to manage projects, task
 | Category | Feature |
 |---|---|
 | **Authentication** | JWT-based auth with Access & Refresh token rotation, secure HTTP-only cookie storage |
+| **Session Management** | Dual-layer session validation on both REST routes and Socket.io connections, with Redis-cached session lookups and MongoDB TTL-based auto-expiry |
 | **Authorization** | Role-based access control (RBAC) — `OWNER` and `MEMBER` roles per project, `ADMIN` and `USER` system roles |
 | **Projects** | Full CRUD, soft-delete, owner-only management, member invitation system |
 | **Tasks** | Create, assign, update, mark complete, delete — scoped to projects with status tracking (`PENDING`, `IN_PROGRESS`, `DONE`) |
 | **Messaging** | Project-scoped messaging with edit/delete support and file attachment references |
-| **Real-time** | Socket.io integration with Redis adapter for scalable real-time events |
+| **Real-time** | Socket.io integration with `auth:update` event for seamless token refresh, presence tracking, typing indicators, and project-scoped chat rooms |
+| **Multi-Server Ready** | IORedis-based Pub/Sub adapter (`@socket.io/redis-adapter`) enables horizontal scaling across multiple server instances |
 | **Caching** | Redis caching layer on read-heavy endpoints (project reads, task listings) with automatic invalidation |
 | **Logging** | Activity logs (user actions within projects) and Audit logs (security events like login, logout, role changes) |
 | **Validation** | Joi schema validation middleware on all mutation endpoints |
@@ -102,7 +107,8 @@ Client Request
 | **Node.js** | JavaScript runtime |
 | **Express.js v5** | Web framework |
 | **MongoDB** (Mongoose v9) | Primary database |
-| **Redis** (ioredis) | Caching & Socket.io adapter |
+| **IORedis** | Redis client — used for caching, session storage, and Pub/Sub adapter |
+| **@socket.io/redis-adapter** | Redis Pub/Sub adapter for multi-server Socket.io |
 
 ### Security & Auth
 
@@ -159,7 +165,7 @@ The application uses **9 Mongoose models** to represent the domain:
 |---|---|---|
 | **ActivityLog** | `userId`, `projectId`, `action`, `entityType`, `metadata` | Tracks 12 action types across project, task, message, and member operations |
 | **AuditLog** | `userId`, `action`, `targetType`, `ipAddress`, `userAgent`, `metadata` | Security-focused logs for authentication and sensitive operations |
-| **Session** | — | Session tracking for user login sessions |
+| **Session** | `userId`, `refreshToken`, `isActive`, `expiresAt`, `ipAddress`, `userAgent` | Persistent session records with UUID-based IDs, TTL auto-expiry index, and Redis-cached lookups |
 
 ---
 
@@ -212,6 +218,178 @@ The application uses **9 Mongoose models** to represent the domain:
 | `GET` | `/message/:id` | Get messages for a project | Member |
 | `PATCH` | `/message/edit/:id` | Edit a message | Any authenticated user |
 | `DELETE` | `/message/delete/:id` | Delete a message | Any authenticated user |
+
+---
+
+## 🔄 Session Management
+
+This application implements **dual-layer session management** that works consistently across both REST API routes and Socket.io connections.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     SESSION LIFECYCLE                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Login ──▶ Session created in MongoDB ──▶ JWT issued             │
+│              (contains sessionId)          (embeds sessionId)    │
+│                                                                 │
+│  Request ──▶ JWT verified ──▶ Session checked in Redis           │
+│                                  │                              │
+│                            Cache Miss?                          │
+│                                  │                              │
+│                          MongoDB lookup ──▶ Cache in Redis       │
+│                             (7-day TTL)                         │
+│                                                                 │
+│  Logout ──▶ Session deactivated ──▶ Redis cache cleared          │
+│                                                                 │
+│  Expiry ──▶ MongoDB TTL index auto-deletes expired sessions     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### REST API Sessions
+
+Every authenticated REST request goes through `authMiddleware`, which:
+
+1. Extracts and verifies the JWT access token from the `Authorization` header
+2. Reads the embedded `sessionId` from the token payload
+3. Checks Redis cache (`session:{sessionId}`) for the session status
+4. On cache miss → falls back to MongoDB, validates `isActive` and `expiresAt`, then caches it in Redis with a 7-day TTL
+5. Rejects requests with expired or deactivated sessions
+
+### Socket.io Sessions
+
+Socket connections are authenticated at two points:
+
+1. **On connect** — The `socketMiddleware` verifies the JWT sent via `handshake.headers.authorization` and attaches the decoded user to `socket.user`
+2. **On token refresh** — The `auth:update` event allows clients to seamlessly update their token on an active socket connection without disconnecting:
+
+```js
+// Client-side: refresh token on an active socket
+socket.emit("auth:update", { token: newAccessToken });
+
+// Server verifies the new token and updates socket.user
+// Emits "auth:success" on success, or "auth:error" + disconnect on failure
+```
+
+This approach ensures that long-lived socket connections survive access token rotation without requiring a full reconnect.
+
+### Session Model
+
+| Field | Type | Description |
+|---|---|---|
+| `_id` | `UUID (v4)` | Unique session identifier (embedded in JWT) |
+| `userId` | `ObjectId` | Reference to the authenticated user |
+| `refreshToken` | `String` | Hashed refresh token for this session |
+| `isActive` | `Boolean` | Whether the session is currently valid |
+| `expiresAt` | `Date` | Session expiration timestamp (auto-deleted via MongoDB TTL index) |
+| `ipAddress` | `String` | Client IP at session creation |
+| `userAgent` | `String` | Client user-agent at session creation |
+
+---
+
+## 🔌 Real-Time Events (Socket.io)
+
+The application uses Socket.io for real-time communication within project rooms. All socket connections require JWT authentication.
+
+### Connection Flow
+
+1. Client connects with JWT in `handshake.headers.authorization`
+2. `socketMiddleware` verifies the token
+3. User is auto-joined to their personal room (`user:{userId}`)
+4. Online presence is broadcast to all project rooms the user belongs to
+5. Connection count is tracked in Redis for multi-device support
+
+### Event Reference
+
+#### Authentication Events
+
+| Event | Direction | Payload | Description |
+|---|---|---|---|
+| `auth:update` | Client → Server | `{ token }` | Update JWT on an active connection (after token refresh) |
+| `auth:success` | Server → Client | — | Token update was successful |
+| `auth:error` | Server → Client | `{ message }` | Token update failed (socket disconnects) |
+
+#### Room Events
+
+| Event | Direction | Payload | Description |
+|---|---|---|---|
+| `room:join` | Client → Server | `{ roomId }` | Join a project room (membership validated via Redis/MongoDB) |
+| `room:joined` | Server → Room | `{ username, userId, message }` | Broadcast to room members when someone joins |
+| `room:joined:self` | Server → Client | `{ message }` | Confirmation sent to the joining user |
+| `room:leave` | Client → Server | `{ roomId }` | Leave a project room |
+| `member:left` | Server → Room | `{ userId }` | Broadcast to room when a member leaves |
+
+#### Messaging Events
+
+| Event | Direction | Payload | Description |
+|---|---|---|---|
+| `message:send` | Client → Server | `{ roomId, message }` | Send a message to a project room |
+| `message:received` | Server → Room | `{ newMessage }` | Broadcast new message to the entire room |
+| `chat:send` | Server → Client | `{ chats }` | Initial message history (last 20 messages) sent on room join |
+
+#### Typing Indicators
+
+| Event | Direction | Payload | Description |
+|---|---|---|---|
+| `typing:start` | Client → Server | `{ roomId }` | Notify room that user started typing |
+| `typing:started` | Server → Room | `{ userId, username }` | Broadcast typing indicator to room |
+| `typing:stop` | Client → Server | `{ roomId }` | Notify room that user stopped typing |
+| `typing:stopped` | Server → Room | `{ userId }` | Broadcast typing stop to room |
+
+#### Presence Events
+
+| Event | Direction | Payload | Description |
+|---|---|---|---|
+| `presence:online` | Server → Room | `{ userId }` | Broadcast when user's first device connects |
+| `presence:offline` | Server → Room | `{ userId }` | Broadcast when user's last device disconnects |
+
+> **Multi-device aware**: The server tracks connection count per user in Redis. Presence events only fire on the first connect and last disconnect, not on every device.
+
+---
+
+## 🌐 Multi-Server Scalability (IORedis Pub/Sub)
+
+The application is architected to support **horizontal scaling** across multiple server instances using **IORedis** and the **Redis Pub/Sub** pattern.
+
+### How It Works
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Server 1   │     │   Server 2   │     │   Server N   │
+│  (Socket.io) │     │  (Socket.io) │     │  (Socket.io) │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       ▼                    ▼                    ▼
+┌─────────────────────────────────────────────────────────┐
+│                     Redis (Pub/Sub)                      │
+│                                                         │
+│   pubClient ──publish──▶  channel  ──subscribe──▶ subClient │
+│                                                         │
+│   @socket.io/redis-adapter syncs events across servers  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Implementation Details
+
+- **IORedis** is used as the Redis client (instead of the `redis` package) for its robust Pub/Sub support, automatic reconnection, and cluster compatibility
+- Two dedicated IORedis clients are created — a **pubClient** (publisher) and a **subClient** (subscriber via `pubClient.duplicate()`)
+- The `@socket.io/redis-adapter` uses these clients to synchronize Socket.io events across server instances
+- When a message is emitted on Server 1, Redis Pub/Sub ensures it is delivered to clients connected to Server 2, Server 3, etc.
+
+### What This Enables
+
+| Capability | Description |
+|---|---|
+| **Horizontal Scaling** | Run multiple Node.js instances behind a load balancer |
+| **Shared Rooms** | Clients on different servers can join the same project room |
+| **Cross-Server Events** | Messages, typing indicators, and presence events propagate across all instances |
+| **Session Consistency** | Redis-cached sessions are accessible from any server instance |
+| **Zero Downtime Deploys** | Roll out updates one server at a time without dropping connections |
+
+> **Note**: IORedis and the Pub/Sub adapter are already configured and ready. To run multiple instances, simply start the application behind a load balancer (e.g., Nginx, HAProxy, or a cloud ALB) with sticky sessions or the Redis adapter handling session affinity.
 
 ---
 
@@ -403,12 +581,15 @@ This application implements multiple layers of security:
 
 - **Password Hashing** — All passwords are hashed using `bcrypt` before storage
 - **JWT Token Rotation** — Short-lived access tokens with refresh token rotation via HTTP-only cookies
+- **Session Validation** — Every request (REST and Socket) is validated against active sessions cached in Redis with MongoDB fallback
+- **Socket Auth Refresh** — The `auth:update` event allows clients to update their JWT on active socket connections without reconnecting
 - **HTTP Security Headers** — `helmet` sets security-related HTTP headers
 - **CORS** — Configurable cross-origin resource sharing
 - **Input Validation** — All incoming data is validated with Joi schemas
 - **Role-Based Access** — Endpoints are protected by ownership and membership checks
 - **Audit Logging** — All security-sensitive actions (login, logout, role changes) are logged with IP address and user agent
 - **Soft Deletes** — Records are soft-deleted (via `deletedAt` timestamp) rather than permanently removed for data recovery and audit compliance
+- **Multi-Server Ready** — IORedis Pub/Sub adapter ensures consistent state across horizontally scaled instances
 
 ---
 
